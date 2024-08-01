@@ -1,11 +1,25 @@
 import { HttpClient } from '@angular/common/http';
 import { computed, inject, Injectable, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { catchError, EMPTY, map } from 'rxjs';
+import { FormControl } from '@angular/forms';
+import {
+  catchError,
+  concatMap,
+  debounceTime,
+  distinctUntilChanged,
+  EMPTY,
+  map,
+  startWith,
+  Subject,
+  switchMap,
+} from 'rxjs';
 import type { Gif, RedditPost, RedditResponse } from '../interfaces';
 
 export interface GifsState {
   gifs: Gif[];
+  error: string | null;
+  loading: boolean;
+  lastKnownGif: string | null;
 }
 
 @Injectable({
@@ -13,34 +27,86 @@ export interface GifsState {
 })
 export class RedditService {
   private http = inject(HttpClient);
+  subredditFormControl = new FormControl();
 
   // state
-  private state = signal<GifsState>({ gifs: [] });
+  private state = signal<GifsState>({
+    gifs: [],
+    error: null,
+    loading: false,
+    lastKnownGif: null,
+  });
 
   // setters
   gifs = computed(() => this.state().gifs);
+  error = computed(() => this.state().error);
+  loading = computed(() => this.state().loading);
+  lastKnownGif = computed(() => this.state().lastKnownGif);
 
   // sources/actions
-  gifsLoaded$ = this.fetchFromReddit('gifs');
+  pagination$ = new Subject<string | null>();
+  private subredditChanged$ = this.subredditFormControl.valueChanges.pipe(
+    debounceTime(300),
+    distinctUntilChanged(),
+    startWith('gifs'),
+    map((subreddit) => (subreddit.length ? subreddit : 'gifs'))
+  );
+  private gifsLoaded$ = this.subredditChanged$.pipe(
+    switchMap((subreddit) =>
+      this.pagination$.pipe(
+        startWith(null),
+        concatMap((lastKnownGif) =>
+          this.fetchFromReddit(subreddit, lastKnownGif, 20)
+        )
+      )
+    )
+  );
 
   constructor() {
     // reducers
-    this.gifsLoaded$.pipe(takeUntilDestroyed()).subscribe((gifs) =>
+    this.gifsLoaded$.pipe(takeUntilDestroyed()).subscribe((response) =>
       this.state.update((state) => ({
         ...state,
-        gifs: [...state.gifs, ...gifs],
+        gifs: [...state.gifs, ...response.gifs],
+        loading: false,
+        lastKnownGif: response.lastKnownGif,
+      }))
+    );
+
+    this.subredditChanged$.pipe(takeUntilDestroyed()).subscribe(() =>
+      this.state.update((state) => ({
+        ...state,
+        error: null,
+        loading: true,
+        lastKnownGif: null,
       }))
     );
   }
 
-  private fetchFromReddit(subreddit: string) {
+  private fetchFromReddit(
+    subreddit: string,
+    after: string | null,
+    gifsRequired: number
+  ) {
     return this.http
       .get<RedditResponse>(
-        `https://www.reddit.com/r/${subreddit}/hot/.json?limit=100`
+        `https://www.reddit.com/r/${subreddit}/hot/.json?limit=10` +
+          (after ? `&after=${after}` : '')
       )
       .pipe(
         catchError(() => EMPTY),
-        map((response) => this.convertRedditPostsToGifs(response.data.children))
+        map((response) => {
+          const posts = response.data.children;
+          const lastKnownGif = posts.length
+            ? posts[posts.length - 1].data.name
+            : null;
+
+          return {
+            gifs: this.convertRedditPostsToGifs(response.data.children),
+            gifsRequired,
+            lastKnownGif,
+          };
+        })
       );
   }
 
