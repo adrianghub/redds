@@ -1,4 +1,4 @@
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, type HttpErrorResponse } from '@angular/common/http';
 import { computed, inject, Injectable, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FormControl } from '@angular/forms';
@@ -8,6 +8,7 @@ import {
   debounceTime,
   distinctUntilChanged,
   EMPTY,
+  expand,
   map,
   startWith,
   Subject,
@@ -45,6 +46,7 @@ export class RedditService {
 
   // sources/actions
   pagination$ = new Subject<string | null>();
+  private error$ = new Subject<string>();
   private subredditChanged$ = this.subredditFormControl.valueChanges.pipe(
     debounceTime(300),
     distinctUntilChanged(),
@@ -56,7 +58,26 @@ export class RedditService {
       this.pagination$.pipe(
         startWith(null),
         concatMap((lastKnownGif) =>
-          this.fetchFromReddit(subreddit, lastKnownGif, 20)
+          this.fetchFromReddit(subreddit, lastKnownGif, 1).pipe(
+            expand((response, index) => {
+              const { gifs, gifsRequired, lastKnownGif } = response;
+              const remainingGifsToLoad = gifsRequired - gifs.length;
+              const maxAttempts = 1;
+
+              const shouldKeepLoading =
+                remainingGifsToLoad > 0 &&
+                index < maxAttempts &&
+                lastKnownGif !== null;
+
+              return shouldKeepLoading
+                ? this.fetchFromReddit(
+                    subreddit,
+                    lastKnownGif,
+                    remainingGifsToLoad
+                  )
+                : EMPTY;
+            })
+          )
         )
       )
     )
@@ -79,6 +100,14 @@ export class RedditService {
         error: null,
         loading: true,
         lastKnownGif: null,
+        gifs: [],
+      }))
+    );
+
+    this.error$.pipe(takeUntilDestroyed()).subscribe((error) =>
+      this.state.update((state) => ({
+        ...state,
+        error,
       }))
     );
   }
@@ -90,11 +119,14 @@ export class RedditService {
   ) {
     return this.http
       .get<RedditResponse>(
-        `https://www.reddit.com/r/${subreddit}/hot/.json?limit=10` +
+        `https://www.reddit.com/r/${subreddit}/hot/.json?limit=100` +
           (after ? `&after=${after}` : '')
       )
       .pipe(
-        catchError(() => EMPTY),
+        catchError((err) => {
+          this.handleError(err);
+          return EMPTY;
+        }),
         map((response) => {
           const posts = response.data.children;
           const lastKnownGif = posts.length
@@ -168,5 +200,16 @@ export class RedditService {
 
     // No useable formats available
     return null;
+  }
+
+  private handleError(err: HttpErrorResponse) {
+    // Handle specific error cases
+    if (err.status === 404 && err.url) {
+      this.error$.next(`Failed to load gifs for /r/${err.url.split('/')[4]}`);
+      return;
+    }
+
+    // Generic error if no cases match
+    this.error$.next(err.statusText);
   }
 }
